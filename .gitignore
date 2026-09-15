@@ -1,0 +1,14 @@
+.toolchain/
+agent/target/
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+.local/
+*.sqlite*
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+artifacts/
+__pycache__/

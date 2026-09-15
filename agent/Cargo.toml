@@ -1,0 +1,26 @@
+[package]
+name = "system-monitor-agent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/soloveynchub/sysmo"
+description = "Local macOS system monitor with a Rust agent and a PWA dashboard"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+macmon = { version = "0.8.2", default-features = false }
+sysinfo = "0.37"
+libc = "0.2"
+tower-http = { version = "0.6", features = ["fs"] }
+futures-util = "0.3"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+strip = true
+lto = "thin"
