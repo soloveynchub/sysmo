@@ -13,12 +13,13 @@ pub fn endpoint()->Result<PathBuf,String>{
  [home.join(".docker/run/docker.sock"),PathBuf::from("/var/run/docker.sock")].into_iter().find(|p|p.exists()).ok_or_else(||if PathBuf::from("/Applications/Docker.app").exists(){"daemon_unavailable".into()}else{"not_installed".into()})
 }
 fn unix(s:&str)->Result<PathBuf,String>{s.strip_prefix("unix://").filter(|p|p.starts_with('/')).map(PathBuf::from).ok_or("unsupported_remote".into())}
-async fn get(socket:&PathBuf,path:&str)->Result<Value,String>{
- timeout(Duration::from_secs(3),async{
+pub async fn get(socket:&PathBuf,path:&str)->Result<Value,String>{request(socket,"GET",path,15).await}
+pub async fn request(socket:&PathBuf,method:&str,path:&str,seconds:u64)->Result<Value,String>{
+ timeout(Duration::from_secs(seconds),async{
  let mut s=UnixStream::connect(socket).await.map_err(|e|e.to_string())?;
- s.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|e|e.to_string())?;
+ s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|e|e.to_string())?;
  let mut buf=vec![];s.take(8*1024*1024).read_to_end(&mut buf).await.map_err(|e|e.to_string())?;
- let i=buf.windows(4).position(|w|w==b"\r\n\r\n").ok_or("bad_http")?;let head=String::from_utf8_lossy(&buf[..i]);if !head.starts_with("HTTP/1.1 200"){return Err(head.lines().next().unwrap_or("http_error").into())}
+ let i=buf.windows(4).position(|w|w==b"\r\n\r\n").ok_or("bad_http")?;let head=String::from_utf8_lossy(&buf[..i]);let code=head.split_whitespace().nth(1).unwrap_or("");if !matches!(code,"200"|"201"|"204"){return Err(format!("Docker {}: {}",code,String::from_utf8_lossy(&buf[i+4..]).chars().take(400).collect::<String>()))}if code=="204"{return Ok(Value::Null)}
  let body=&buf[i+4..];let bytes=if head.to_lowercase().contains("transfer-encoding: chunked"){let mut out=vec![];let mut rest=body;loop{let i=rest.windows(2).position(|w|w==b"\r\n").ok_or("bad_chunk")?;let size=usize::from_str_radix(std::str::from_utf8(&rest[..i]).map_err(|_|"bad_chunk")?.split(';').next().unwrap(),16).map_err(|_|"bad_chunk")?;if size==0{break}if rest.len()<i+2+size+2{return Err("short_chunk".into())}out.extend_from_slice(&rest[i+2..i+2+size]);rest=&rest[i+2+size+2..];}out}else{body.to_vec()};
  serde_json::from_slice(&bytes).map_err(|e|e.to_string())
  }).await.map_err(|_|"timeout".to_string())?
@@ -47,4 +48,22 @@ impl Docker {
  }
 }
 fn nval(v:&Value)->f64{v.as_f64().unwrap_or(0.0)}
-#[cfg(test)]mod tests{use super::*;#[test]fn excludes_remote_endpoints(){assert!(unix("tcp://remote:2375").is_err());assert!(unix("ssh://remote").is_err());assert_eq!(unix("unix:///tmp/docker.sock").unwrap(),PathBuf::from("/tmp/docker.sock"));}}
+pub async fn inventory()->Result<Value,String>{
+ use std::os::unix::fs::MetadataExt;
+ let socket=endpoint()?;let engine=get(&socket,"/info").await.unwrap_or(Value::Null);let df=get(&socket,"/system/df").await?;let mut containers=df["Containers"].as_array().cloned().unwrap_or_default();
+ for c in &mut containers {if let Some(id)=c["Id"].as_str().map(str::to_owned){if let Ok(v)=get(&socket,&format!("/containers/{id}/json")).await{c["FinishedAt"]=v["State"]["FinishedAt"].clone();c["StartedAt"]=v["State"]["StartedAt"].clone();c["Mounts"]=v["Mounts"].clone();c["Managed"]=json!(v["Config"]["Labels"].get("com.docker.swarm.service.id").is_some());}}}
+ let home=PathBuf::from(env::var("HOME").unwrap_or_default());
+ let raw=home.join("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw");
+ // This is the default Desktop path only; custom locations are explicitly unknown.
+ let disk=fs::metadata(&raw).ok().filter(|m|m.is_file()).map(|m|json!({"path":raw,"allocated":m.blocks().saturating_mul(512),"limit":m.len()}));
+ Ok(json!({"status":"available","ts":crate::collector::now(),"socket":socket,"engine_id":engine["ID"],"containers":containers,"images":df["Images"],"volumes":df["Volumes"],"cache":df["BuildCache"],"layers_size":df["LayersSize"],"desktop_disk":disk}))
+}
+#[cfg(test)]mod tests{
+ use super::*;
+ #[test]fn excludes_remote_endpoints(){assert!(unix("tcp://remote:2375").is_err());assert!(unix("ssh://remote").is_err());assert_eq!(unix("unix:///tmp/docker.sock").unwrap(),PathBuf::from("/tmp/docker.sock"));}
+ #[tokio::test]async fn delete_contract_never_forces_or_removes_volumes(){
+  let path=std::env::temp_dir().join(format!("sysmo-http-{}.sock",std::process::id()));let server=tokio::net::UnixListener::bind(&path).unwrap();let expected=format!("/containers/{}?force=false&v=false","a".repeat(64));let route=expected.clone();
+  let task=tokio::spawn(async move{let(mut conn,_)=server.accept().await.unwrap();let mut b=[0;2048];let n=conn.read(&mut b).await.unwrap();let head=String::from_utf8_lossy(&b[..n]);assert!(head.starts_with(&format!("DELETE {route} HTTP/1.1\r\n")));assert!(!head.contains("force=true"));assert!(!head.contains("v=true"));conn.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();});
+  assert_eq!(request(&path,"DELETE",&expected,2).await.unwrap(),Value::Null);task.await.unwrap();std::fs::remove_file(path).unwrap();
+ }
+}

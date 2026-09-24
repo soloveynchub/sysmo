@@ -10,6 +10,17 @@ struct NativeMem { compressed:u64,wired:u64,active:u64,inactive:u64,free:u64,pur
 struct NativeBattery { charge:f64,charging:f64,external:f64,cycles:f64,health:f64,remaining:f64 }
 unsafe extern "C" { fn sm_process(pid:i32,out:*mut NativeProc)->i32; fn sm_memory(out:*mut NativeMem); fn sm_battery(out:*mut NativeBattery)->i32; fn sm_thermal()->i32;fn sm_list(pids:*mut i32,count:i32)->i32;fn sm_metadata(pid:i32,cwd:*mut libc::c_char,command:*mut libc::c_char,cap:i32); }
 pub fn now()->f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() }
+pub fn action_process(id:&str)->Result<Value,String>{
+ let (pid,start)=id.split_once(':').ok_or("Некорректный ID процесса")?;let pid:i32=pid.parse().map_err(|_|"Некорректный PID")?;let start:u64=start.parse().map_err(|_|"Некорректное время запуска")?;
+ if pid<=1||pid==std::process::id() as i32||start==0{return Err("Служебный процесс защищён".into())}
+ let mut n:NativeProc=unsafe{std::mem::zeroed()};if unsafe{sm_process(pid,&mut n)}==0||n.start_us!=start{return Err("Процесс завершился или PID уже принадлежит другому процессу".into())}
+ let exe=unsafe{CStr::from_ptr(n.exe.as_ptr())}.to_string_lossy().into_owned();let name=unsafe{CStr::from_ptr(n.name.as_ptr())}.to_string_lossy().into_owned();
+ if n.uid<501||n.uid as u32!=unsafe{libc::geteuid()}||exe.is_empty()||exe.starts_with("/System/")||exe.starts_with("/usr/libexec/")||exe.starts_with("/usr/sbin/")||["docker","com.docker","virtualization","system-monitor","windowserver","loginwindow","launchd"].iter().any(|s|format!("{exe} {name}").to_lowercase().contains(s)){return Err("Системный процесс, Docker VM или процесс другого пользователя защищён".into())}
+ // Also protect the agent's ancestors, including its launcher.
+ let mut ancestor=unsafe{libc::getppid()};for _ in 0..32{if ancestor<=1{break}if pid==ancestor{return Err("Процесс запуска монитора защищён".into())}let mut parent:NativeProc=unsafe{std::mem::zeroed()};if unsafe{sm_process(ancestor,&mut parent)}==0{break}ancestor=parent.ppid;}
+ Ok(json!({"id":id,"pid":pid,"name":name,"executable":exe,"memory":n.footprint,"signal":"SIGTERM"}))
+}
+pub fn terminate_process(id:&str)->Result<(),String>{let p=action_process(id)?;let pid=p["pid"].as_i64().ok_or("PID unavailable")? as i32;if unsafe{libc::kill(pid,libc::SIGTERM)}!=0{return Err(std::io::Error::last_os_error().to_string())}Ok(())}
 fn opt(n:f64)->Option<f64>{ if n>=0.0 && n.is_finite(){Some(n)}else{None} }
 pub fn classify(name:&str,cmd:&str)->(String,bool,bool){
  if name=="system-monitor-agent"{return ("System Monitor Agent".into(),false,false)}
@@ -50,7 +61,8 @@ impl Collector {
   let app=exe.as_ref().and_then(|s|s.split(".app/").next().filter(|_|s.contains(".app/")).and_then(|v|v.rsplit('/').next())).map(str::to_owned);
   let cpu=if n.threads==0{None}else{self.cpu_previous.insert(id.clone(),n.cpu_ns).and_then(|prev|if n.cpu_ns>=prev && dt>0.0{Some((n.cpu_ns-prev) as f64/1e9/dt*100.0)}else{None})};
   let user=self.user_cache.entry(n.uid).or_insert_with(||unsafe{let u=libc::getpwuid(n.uid as u32);if u.is_null(){n.uid.to_string()}else{CStr::from_ptr((*u).pw_name).to_string_lossy().into_owned()}}).clone();
-  rows.push(json!({"id":id,"pid":pid,"ppid":n.ppid,"name":name,"label":label,"command":cmd,"executable":exe,"cwd":if cwd.is_empty(){None}else{Some(&cwd)},"project":if dev && !cwd.is_empty() && cwd!="/"{Some(cwd.clone())}else{None},"user":user,"cpu":cpu,"rss":if n.threads>0{Some(n.rss)}else{None},"footprint":if usage{Some(n.footprint)}else{None},"memory":if usage{Some(n.footprint)}else if n.threads>0{Some(n.rss)}else{None},"memory_kind":if usage{"footprint"}else{"rss"},"threads":if n.threads>0{Some(n.threads)}else{None},"start":start as f64/1e6,"uptime":(ts-start as f64/1e6).max(0.0),"state":match n.state{1=>"Idle",2=>"Runnable",3=>"Sleeping",4=>"Stopped",5=>"Zombie",_=>"Unknown"},"read":read,"write":write,"write_windows":windows,"read_total":if usage{Some(n.read)}else{None},"write_total":if usage{Some(n.write)}else{None},"network":Value::Null,"development":dev,"node":node,"application":app}));
+  let manage_allowed=action_process(&id).is_ok();
+  rows.push(json!({"manage_allowed":manage_allowed,"id":id,"pid":pid,"ppid":n.ppid,"name":name,"label":label,"command":cmd,"executable":exe,"cwd":if cwd.is_empty(){None}else{Some(&cwd)},"project":if dev && !cwd.is_empty() && cwd!="/"{Some(cwd.clone())}else{None},"user":user,"cpu":cpu,"rss":if n.threads>0{Some(n.rss)}else{None},"footprint":if usage{Some(n.footprint)}else{None},"memory":if usage{Some(n.footprint)}else if n.threads>0{Some(n.rss)}else{None},"memory_kind":if usage{"footprint"}else{"rss"},"threads":if n.threads>0{Some(n.threads)}else{None},"start":start as f64/1e6,"uptime":(ts-start as f64/1e6).max(0.0),"state":match n.state{1=>"Idle",2=>"Runnable",3=>"Sleeping",4=>"Stopped",5=>"Zombie",_=>"Unknown"},"read":read,"write":write,"write_windows":windows,"read_total":if usage{Some(n.read)}else{None},"write_total":if usage{Some(n.write)}else{None},"network":Value::Null,"development":dev,"node":node,"application":app}));
  }
  self.previous.retain(|k,_|identities.contains(k));self.metadata.retain(|k,_|identities.contains(k));self.cpu_previous.retain(|k,_|identities.contains(k));self.write_history.retain(|k,_|identities.contains(k));
  // Attribute each PID exactly once to its outermost observed application ancestor.
@@ -67,4 +79,10 @@ impl Collector {
  self.first=false;(result,rows)
  }
 }
-#[cfg(test)] mod tests {use super::*;#[test]fn classifies_real_command_patterns(){assert_eq!(classify("node","node /project/node_modules/vite/bin/vite.js").0,"Vite dev server");assert!(classify("node","/usr/bin/node tsserver.js").2);assert!(!classify("WindowServer","").1);}}
+#[cfg(test)] mod tests {use super::*;#[test]fn classifies_real_command_patterns(){assert_eq!(classify("node","node /project/node_modules/vite/bin/vite.js").0,"Vite dev server");assert!(classify("node","/usr/bin/node tsserver.js").2);assert!(!classify("WindowServer","").1);}
+ #[test]fn only_exact_owned_disposable_process_can_be_terminated(){
+  let mut child=std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();let pid=child.id() as i32;let mut native:NativeProc=unsafe{std::mem::zeroed()};assert_ne!(unsafe{sm_process(pid,&mut native)},0);let id=format!("{pid}:{}",native.start_us);
+  assert!(action_process(&format!("{pid}:{}",native.start_us+1)).is_err());assert!(action_process("1:1").is_err());assert!(action_process(&format!("{}:1",std::process::id())).is_err());
+  let result=terminate_process(&id);if result.is_err(){let _=child.kill();}assert!(result.is_ok(),"{result:?}");let status=child.wait().unwrap();assert!(!status.success());assert!(action_process(&id).is_err());
+ }
+}

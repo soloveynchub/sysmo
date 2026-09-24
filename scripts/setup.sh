@@ -15,6 +15,11 @@ if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$ROOT/.toolchain/cargo/bin/carg
   CARGO_HOME="$ROOT/.toolchain/cargo" RUSTUP_HOME="$ROOT/.toolchain/rustup" sh "$INSTALLER" -y --profile minimal --default-toolchain stable --no-modify-path
 fi
 (cd "$ROOT/frontend" && npm ci && npm run build)
+(cd "$ROOT/scripts" && python3 -m unittest -v test_workspace_monitor.py test_workspace_ai.py test_disk_layout.py)
 "$ROOT/scripts/cargo.sh" test --locked
 "$ROOT/scripts/cargo.sh" build --release --locked
+# Optional, read-only Apple model availability probe. Monitoring does not depend on it.
+if ! xcrun swiftc -module-cache-path "$ROOT/agent/target/swift-module-cache" "$ROOT/agent/native/WorkspaceAI.swift" -o "$ROOT/agent/target/release/workspace-ai"; then
+  echo 'Проверка Foundation Models недоступна; мониторинг работает без AI.' >&2
+fi
 printf '\nСборка готова. Запуск: python3 scripts/manage.py install\n'

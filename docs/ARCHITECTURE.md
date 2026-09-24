@@ -7,7 +7,7 @@
 
 1. Hardware: постоянный macmon Sampler в отдельном потоке; аппаратные показатели.
 2. Host: sysinfo и небольшой C bridge к SDK macOS; процессы, память, сеть, накопители, батарея.
-3. Docker: локальный Unix socket, read-only Engine API. Контейнеры не суммируются повторно с Docker VM.
+3. Docker: локальный Unix socket, Engine API: чтение и адресные операции по подтверждённому плану (см. [ADR управления](ADR-management.md)). Контейнеры не суммируются повторно с Docker VM.
 4. History: SQLite, process identity PID + start microseconds, многоуровневые временные buckets.
 5. Diagnostics: правила с длительностью, явно измеренный интервал наблюдения.
 6. Presentation: React/TypeScript, uPlot, раздельные subscriptions, WebSocket.
@@ -42,7 +42,7 @@
 
 ## Безопасность и эксплуатация
 
-Только 127.0.0.1:9899. Проверка Host и Origin, CORS закрыт, CSP self, HTTP API только для чтения.
+Только 127.0.0.1:9899. Проверка Host и Origin, CORS закрыт, CSP self, GET для чтения; POST управления требует Origin, токен и одноразовый план.
 Docker удалённые endpoints не опрашиваются: DOCKER_HOST/context с TCP/SSH дают явное состояние unsupported_remote.
 Аргументы процессов могут содержать секреты: отображать локально, не отправлять в сеть; не сохранять полный command line в историю.
 История хранится в пользовательском Application Support с приватными правами. LaunchAgent работает от пользователя, KeepAlive восстанавливает процесс.
@@ -82,3 +82,15 @@ SVG показывает функциональную, не физически �
 Анимация приостанавливается вне viewport, в скрытой вкладке, при пользовательской паузе и prefers-reduced-motion. Canvas uPlot использует явный system-ui font stack. Tooltip рисуется в портале body, ограничен границами окна и скрывается при выходе указателя, прокрутке и Escape. Для длительных диапазонов ось включает дату.
 
 Фон охлаждения — статический локальный PNG; крыльчатка и условные линии воздуха — SVG с Web Animations. Источник иллюстрации и ограничения описаны в [COOLING_ASSET.md](COOLING_ASSET.md).
+
+
+## Рабочие проекты
+
+Отдельный read-only Python worker, development.sqlite, единичный обход под flock, автоматический интервал 6 часов. Git-проверки не выполняют fetch или модификации. Ручная сверка ls-remote читает refs. API и ограничения: [WORKSPACES.md](WORKSPACES.md), решения: [ADR-workspaces.md](ADR-workspaces.md).
+
+
+## Полный SSD и AI Gateway
+
+`disk_layout.py` раз в 60 секунд читает `diskutil info/apfs list/list -plist` в отдельном потоке. Основной APFS сопоставляется с физическим store; физическая ёмкость не подменяется ёмкостью тома. Сегменты сверяются с общей ёмкостью; несогласованный расклад заменяется общим occupied-сегментом. Многодисковые схемы помечаются неподдерживаемыми. Метаданные папок и сегменты APFS — разные уровни учёта; размеры clones/snapshots не складываются как гарантированно освобождаемые байты.
+
+Timeweb AI Gateway — опциональный внешний анализ обезличенных снимков по явной кнопке. `workspace-ai.sqlite` хранит ключ и ответы только локально, вне репозитория; права 0600. Endpoint фиксирован, redirects запрещены, ключ не входит в model messages или ответы API. AI не имеет инструментов исполнения. Детали: [WORKSPACES.md](WORKSPACES.md).
