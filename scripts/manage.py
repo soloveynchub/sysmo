@@ -28,7 +28,7 @@ def loaded():
 
 
 def wait_ready():
-    for _ in range(30):
+    for _ in range(120):
         try:
             with urllib.request.urlopen(URL + '/api/system', timeout=1) as response:
                 sample = json.load(response)

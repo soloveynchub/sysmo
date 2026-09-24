@@ -9,8 +9,14 @@ const TIERS:[(i64,i64);6]=[(1,900),(5,3600),(15,21600),(60,86400),(300,604800),(
 fn merge(to:&mut Metrics,from:Metrics){for(k,s)in from{to.entry(k).and_modify(|v|{v.count+=s.count;v.sum+=s.sum;v.min=v.min.min(s.min);v.max=v.max.max(s.max);}).or_insert(s);}}
 fn flatten(v:&Value,prefix:&str,out:&mut Metrics){if let Some(n)=v.as_f64(){if n.is_finite(){out.insert(prefix.into(),Stat{count:1,sum:n,min:n,max:n});}}else if let Some(map)=v.as_object(){for(k,v)in map{if ["machine","interfaces","disks","cores","ecpu_cores","pcpu_cores","fans"].contains(&k.as_str()){continue}flatten(v,&if prefix.is_empty(){k.clone()}else{format!("{prefix}.{k}")},out)}}}
 impl History {
+ pub fn reader(path:&Path)->rusqlite::Result<Self>{
+  let conn=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+  conn.busy_timeout(std::time::Duration::from_secs(2))?;
+  Ok(Self{conn,last_cleanup:0})
+ }
+
  pub fn open(path:&Path)->rusqlite::Result<Self>{let conn=Connection::open(path)?;conn.pragma_update(None,"journal_mode","WAL")?;conn.pragma_update(None,"synchronous","NORMAL")?;conn.busy_timeout(std::time::Duration::from_secs(2))?;
- conn.execute_batch("CREATE TABLE IF NOT EXISTS samples(res INTEGER NOT NULL, ts INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(res,ts)); CREATE TABLE IF NOT EXISTS processes(id TEXT NOT NULL, ts INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(id,ts)); CREATE INDEX IF NOT EXISTS processes_time ON processes(ts); CREATE TABLE IF NOT EXISTS events(ts REAL NOT NULL, code TEXT NOT NULL, data TEXT NOT NULL); CREATE INDEX IF NOT EXISTS events_time ON events(ts);")?;Ok(Self{conn,last_cleanup:0})}
+ conn.execute_batch("CREATE TABLE IF NOT EXISTS samples(res INTEGER NOT NULL, ts INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(res,ts)); CREATE INDEX IF NOT EXISTS samples_time ON samples(ts); CREATE TABLE IF NOT EXISTS processes(id TEXT NOT NULL, ts INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(id,ts)); CREATE INDEX IF NOT EXISTS processes_time ON processes(ts); CREATE TABLE IF NOT EXISTS events(ts REAL NOT NULL, code TEXT NOT NULL, data TEXT NOT NULL); CREATE INDEX IF NOT EXISTS events_time ON events(ts);")?;Ok(Self{conn,last_cleanup:0})}
  pub fn record(&mut self,s:&Value,p:&[Value],docker:&Value,watch:&std::collections::HashSet<String>)->rusqlite::Result<()> {
  let ts=s["ts"].as_f64().unwrap_or_default() as i64;let mut metrics=Metrics::new();flatten(s,"",&mut metrics);
  for state in ["normal","warning","critical"]{let n=if s["memory"]["pressure"]==state{1.0}else{0.0};metrics.insert(format!("pressure.{state}"),Stat{count:1,sum:n,min:n,max:n});}
@@ -39,3 +45,23 @@ impl History {
 }
 #[cfg(test)]mod tests{use super::*;#[test]fn weighted_merge_preserves_spike(){let mut a=Metrics::from([("cpu".into(),Stat{count:4,sum:40.0,min:0.0,max:30.0})]);merge(&mut a,Metrics::from([("cpu".into(),Stat{count:1,sum:100.0,min:100.0,max:100.0})]));assert_eq!(a["cpu"].sum/a["cpu"].count as f64,28.0);assert_eq!(a["cpu"].max,100.0);}
 #[test]fn compaction_retains_counts_and_restart_history(){let mut h=History::open(Path::new(":memory:")).unwrap();for t in 1000..1010 {let m=Metrics::from([("cpu".into(),Stat{count:1,sum:(t-1000) as f64,min:(t-1000) as f64,max:(t-1000) as f64})]);h.conn.execute("INSERT INTO samples VALUES(1,?1,?2)",params![t,serde_json::to_string(&m).unwrap()]).unwrap();}h.compact(3000).unwrap();let q=h.query(999.0,1011.0).unwrap();assert_eq!(q.as_array().unwrap().len(),2);assert_eq!(q[0]["metrics"]["cpu"]["count"],5);assert_eq!(q[1]["metrics"]["cpu"]["max"],9.0);h.compact(3000).unwrap();assert_eq!(q,h.query(999.0,1011.0).unwrap());}}
+
+#[cfg(test)]mod reader_tests {
+ use super::*;
+ #[test]fn wal_reader_does_not_block_writer_and_cannot_write(){
+  let path=std::env::temp_dir().join(format!("sysmo-reader-{}-{}.sqlite",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+  {
+   let writer=History::open(&path).unwrap();
+   writer.conn.execute("INSERT INTO samples VALUES(1,1000,'{}')",[]).unwrap();
+   let reader=History::reader(&path).unwrap();
+   reader.conn.execute_batch("BEGIN").unwrap();
+   assert_eq!(reader.query(999.0,1002.0).unwrap().as_array().unwrap().len(),1);
+   writer.conn.execute("INSERT INTO samples VALUES(1,1001,'{}')",[]).unwrap();
+   assert_eq!(reader.query(999.0,1002.0).unwrap().as_array().unwrap().len(),1);
+   reader.conn.execute_batch("COMMIT").unwrap();
+   assert_eq!(reader.query(999.0,1002.0).unwrap().as_array().unwrap().len(),2);
+   assert!(reader.conn.execute("DELETE FROM samples",[]).is_err());
+  }
+  std::fs::remove_file(path).unwrap();
+ }
+}
